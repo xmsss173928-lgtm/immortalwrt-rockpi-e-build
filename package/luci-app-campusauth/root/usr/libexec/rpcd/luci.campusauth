@@ -1,0 +1,42 @@
+#!/bin/sh
+
+case "$1" in
+	list)
+		cat <<'EOF'
+{"status":{},"logs":{},"login":{},"logout":{},"resume":{},"start":{},"stop":{},"restart":{},"clear_logs":{}}
+EOF
+		;;
+	call)
+		case "$2" in
+			status) /usr/libexec/campusauth-core status-json;;
+			logs)
+				logs="$(logread -e CampusAuth 2>/dev/null | tail -n 150)"
+				printf '{"logs":"%s"}\n' "$(printf '%s' "$logs" | sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\n/\\n/g;s/\r/\\r/g')"
+				;;
+			login|resume)
+				if /usr/libexec/campusauth-core resume >/dev/null 2>&1; then
+					printf '{"ok":true}\n'
+				else
+					printf '{"ok":false}\n'
+				fi
+				;;
+			logout)
+				if /usr/libexec/campusauth-core logout >/dev/null 2>&1; then
+					printf '{"ok":true}\n'
+				else
+					printf '{"ok":false}\n'
+				fi
+				;;
+			start|stop|restart)
+				/etc/init.d/campusauth "$2" >/dev/null 2>&1
+				printf '{"ok":true}\n'
+				;;
+			clear_logs)
+				logger -t CampusAuth -- "—— 用户在 LuCI 中标记清空日志 ——"
+				printf '{"ok":true}\n'
+				;;
+			*) printf '{"error":"unknown method"}\n'; exit 1;;
+		esac
+		;;
+	*) exit 1;;
+esac

@@ -1,0 +1,8 @@
+config core "main"
+	option lang "zh_cn"
+	option mediaurlbase "/luci-static/argon"
+	option resourcebase "/luci-static/resources"
+
+config internal "languages"
+	option en "English"
+	option zh_cn "中文"

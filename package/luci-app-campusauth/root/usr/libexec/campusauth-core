@@ -1,0 +1,234 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+TAG="CampusAuth"
+PAUSE_FILE="/var/run/campusauth.paused"
+LAST_REPLY="/var/run/campusauth.last_reply"
+
+log() {
+	logger -t "$TAG" -- "$*"
+}
+
+load_config() {
+	config_load campusauth
+	config_get enabled main enabled 0
+	config_get server main server "http://172.16.0.1"
+	config_get username main username ""
+	config_get password main password ""
+	config_get check_interval main check_interval 5
+	config_get timeout main timeout 4
+	config_get retry_initial main retry_initial 5
+	config_get retry_medium main retry_medium 15
+	config_get retry_max main retry_max 30
+	config_get user_agent main user_agent "Mozilla/5.0"
+	config_get callback_status main callback_status "dr1004"
+	config_get callback_login main callback_login "dr1003"
+	config_get callback_logout main callback_logout "dr1002"
+	config_get r1 main r1 0
+	config_get r3 main r3 0
+	config_get r6 main r6 0
+	config_get para main para 00
+	server="${server%/}"
+	case "$check_interval" in *[!0-9]*|"") check_interval=5;; esac
+	case "$timeout" in *[!0-9]*|"") timeout=4;; esac
+	case "$retry_initial" in *[!0-9]*|"") retry_initial=5;; esac
+	case "$retry_medium" in *[!0-9]*|"") retry_medium=15;; esac
+	case "$retry_max" in *[!0-9]*|"") retry_max=30;; esac
+}
+
+now_ms() {
+	printf '%s000' "$(date +%s)"
+}
+
+curl_common() {
+	curl -fsS --connect-timeout "$timeout" --max-time "$timeout" -A "$user_agent" "$@"
+}
+
+save_reply() {
+	printf '%s' "$1" | head -c 16384 > "$LAST_REPLY"
+}
+
+field() {
+	printf '%s' "$1" | sed -n "s/.*[\\\"']$2[\\\"'][[:space:]]*:[[:space:]]*[\\\"']\{0,1\}\\([^,}\\\"']*\\).*/\\1/p" | head -n1
+}
+
+is_online_reply() {
+	[ "$(field "$1" result)" = "1" ]
+}
+
+check_raw() {
+	load_config
+	[ -n "$server" ] || return 2
+	local reply
+	reply="$(curl_common -G "$server/drcom/chkstatus" \
+		--data-urlencode "callback=$callback_status" \
+		--data-urlencode "jsVersion=4.1" \
+		--data-urlencode "v=$(now_ms)" \
+		--data-urlencode "lang=zh" 2>/dev/null)" || return 2
+	save_reply "$reply"
+	printf '%s' "$reply"
+}
+
+do_login() {
+	load_config
+	[ -n "$server" ] && [ -n "$username" ] && [ -n "$password" ] || {
+		log "未配置认证服务器、账号或密码。"
+		return 2
+	}
+	rm -f "$PAUSE_FILE"
+	local reply
+	reply="$(curl_common -G "$server/drcom/login" \
+		--data-urlencode "callback=$callback_login" \
+		--data-urlencode "DDDDD=$username" \
+		--data-urlencode "upass=$password" \
+		--data-urlencode "0MKKey=123456" \
+		--data-urlencode "R1=$r1" \
+		--data-urlencode "R2=" \
+		--data-urlencode "R3=$r3" \
+		--data-urlencode "R6=$r6" \
+		--data-urlencode "para=$para" \
+		--data-urlencode "terminal_type=1" \
+		--data-urlencode "lang=zh-cn" \
+		--data-urlencode "jsVersion=4.2.1" \
+		--data-urlencode "v=$(now_ms)" 2>/dev/null)" || {
+		log "认证请求失败或超时。"
+		return 1
+	}
+	save_reply "$reply"
+	sleep 1
+	local status msg
+	status="$(check_raw 2>/dev/null)"
+	if is_online_reply "$status"; then
+		log "认证成功，二次状态验证通过。"
+		return 0
+	fi
+	msg="$(field "$reply" msg)"
+	[ -n "$msg" ] || msg="$(field "$reply" message)"
+	log "认证未通过：${msg:-Dr.COM 未返回成功状态}"
+	return 1
+}
+
+do_logout() {
+	load_config
+	: > "$PAUSE_FILE"
+	local reply
+	reply="$(curl_common -G "$server/drcom/logout" \
+		--data-urlencode "callback=$callback_logout" \
+		--data-urlencode "jsVersion=4.1" \
+		--data-urlencode "v=$(now_ms)" \
+		--data-urlencode "lang=zh" 2>/dev/null)" || {
+		log "注销请求失败；自动认证仍已暂停。"
+		return 1
+	}
+	save_reply "$reply"
+	log "已请求注销，并暂停本次开机的自动认证。"
+}
+
+ua2f_running() {
+	if [ -x /etc/init.d/ua2f ] && /etc/init.d/ua2f status 2>/dev/null | grep -qi running; then
+		return 0
+	fi
+	pgrep -f '(^|/|[[:space:]])ua2f([[:space:]]|$)' >/dev/null 2>&1
+}
+
+service_running() {
+	ubus call service list '{"name":"campusauth"}' 2>/dev/null | grep -q '"running":[[:space:]]*true'
+}
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
+}
+
+status_json() {
+	load_config
+	local reply="" online=false auth_state="unknown" message="无法读取认证状态"
+	reply="$(check_raw 2>/dev/null)"
+	if [ -n "$reply" ]; then
+		if is_online_reply "$reply"; then
+			online=true
+			auth_state="online"
+			message="校园网已认证"
+		else
+			auth_state="offline"
+			message="校园网未认证"
+		fi
+	fi
+	local uid ip login_time oltime operator_ip login_epoch now_epoch ua2f=false running=false paused=false configured=false
+	uid="$(field "$reply" uid)"
+	[ -n "$uid" ] || uid="$(field "$reply" user_name)"
+	ip="$(field "$reply" v46ip)"
+	[ -n "$ip" ] || ip="$(field "$reply" client_ip)"
+	login_time="$(field "$reply" login_time)"
+	[ -n "$login_time" ] || login_time="$(field "$reply" stime)"
+	oltime="$(field "$reply" oltime)"
+	operator_ip="$(field "$reply" server_ip)"
+	[ -n "$operator_ip" ] || operator_ip="$(field "$reply" opip)"
+	case "$oltime" in
+		""|*[!0-9]*|4294967295) oltime="" ;;
+	esac
+	if [ -z "$oltime" ] && [ -n "$login_time" ]; then
+		login_epoch="$(date -d "$login_time" +%s 2>/dev/null)"
+		now_epoch="$(date +%s)"
+		case "$login_epoch:$now_epoch" in
+			*[!0-9:]*|:*) ;;
+			*) [ "$now_epoch" -ge "$login_epoch" ] && oltime=$((now_epoch - login_epoch)) ;;
+		esac
+	fi
+	ua2f_running && ua2f=true
+	service_running && running=true
+	[ -e "$PAUSE_FILE" ] && paused=true
+	[ -n "$server" ] && [ -n "$username" ] && [ -n "$password" ] && configured=true
+	printf '{"service_running":%s,"enabled":%s,"paused":%s,"configured":%s,"ua2f_running":%s,"auth_state":"%s","authenticated":%s,"uid":"%s","ip":"%s","login_time":"%s","online_seconds":"%s","operator_ip":"%s","message":"%s"}\n' \
+		"$running" "$([ "$enabled" = 1 ] && echo true || echo false)" "$paused" "$configured" "$ua2f" \
+		"$auth_state" "$online" "$(json_escape "$uid")" "$(json_escape "$ip")" \
+		"$(json_escape "$login_time")" "$(json_escape "$oltime")" "$(json_escape "$operator_ip")" "$(json_escape "$message")"
+}
+
+daemon() {
+	load_config
+	log "监控服务已启动。"
+	local failures=0 delay
+	while :; do
+		load_config
+		if [ -e "$PAUSE_FILE" ]; then
+			sleep "$check_interval"
+			continue
+		fi
+		local reply rc
+		reply="$(check_raw 2>/dev/null)"
+		rc=$?
+		if [ "$rc" -eq 0 ] && is_online_reply "$reply"; then
+			failures=0
+			sleep "$check_interval"
+			continue
+		fi
+		if [ "$rc" -eq 0 ]; then
+			log "Dr.COM 返回未认证，立即尝试登录。"
+		else
+			log "无法读取 Dr.COM 状态，尝试恢复认证。"
+		fi
+		if do_login; then
+			failures=0
+			sleep "$check_interval"
+		else
+			failures=$((failures + 1))
+			case "$failures" in
+				1) delay="$retry_initial";;
+				2) delay="$retry_medium";;
+				*) delay="$retry_max";;
+			esac
+			log "将在 $delay 秒后重试。"
+			sleep "$delay"
+		fi
+	done
+}
+
+case "$1" in
+	daemon) daemon;;
+	status-json) status_json;;
+	login|resume) rm -f "$PAUSE_FILE"; do_login;;
+	logout) do_logout;;
+	check) check_raw;;
+	*) echo "Usage: $0 {daemon|status-json|login|logout|resume|check}" >&2; exit 2;;
+esac

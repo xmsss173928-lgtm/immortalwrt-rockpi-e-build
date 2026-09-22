@@ -1,0 +1,59 @@
+name: build-immortalwrt-rockpi-e
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout config repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q build-essential clang flex bison g++ gawk gettext git \
+            libncurses-dev libssl-dev python3 python3-dev python3-pip python3-pyelftools \
+            python3-setuptools rsync swig unzip zip zlib1g-dev file subversion upx-ucl \
+            patchelf gcc-multilib g++-multilib
+
+      - name: Clone ImmortalWrt 24.10.6 source
+        run: |
+          git clone --depth=1 -b v24.10.6 https://github.com/immortalwrt/immortalwrt.git /tmp/immortalwrt
+
+      - name: Apply custom packages and config
+        run: |
+          cd /tmp/immortalwrt
+          # custom plugin: campusauth 2.0.3
+          cp -r $GITHUB_WORKSPACE/package/luci-app-campusauth package/
+          # default Chinese LuCI settings
+          mkdir -p files
+          cp -r $GITHUB_WORKSPACE/files/* files/
+          # build config
+          cp $GITHUB_WORKSPACE/.config .config
+          # iStore src-link (pinned commit)
+          git clone --depth=1 https://github.com/linkease/istore.git /tmp/istore-src
+          cd /tmp/istore-src && git fetch --depth=1 origin 3fca15b30aeed9ecacb3efc8b4a8b9c2584ad5c7 && git checkout FETCH_HEAD
+          echo "src-link istore /tmp/istore-src" >> /tmp/immortalwrt/feeds.conf
+          cd /tmp/immortalwrt
+          # UA2F required kernel config
+          echo "CONFIG_NETFILTER_NETLINK_GLUE_CT=y" >> target/linux/rockchip/armv8/config-6.6
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/*.img.gz
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/*.manifest
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/sha256sums
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/config.buildinfo
+          if-no-files-found: error
