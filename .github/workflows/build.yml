@@ -29,8 +29,11 @@ jobs:
       - name: Clone ImmortalWrt 24.10.6 source
         run: |
           git clone --depth=1 -b v24.10.6 https://github.com/immortalwrt/immortalwrt.git /tmp/immortalwrt
+          cd /tmp/immortalwrt
+          echo "IMMORTALWRT_REV=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "IMMORTALWRT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo v24.10.6)" >> $GITHUB_ENV
 
-      - name: Apply custom packages and config
+      - name: Apply custom packages, config and device-tree fix
         run: |
           cd /tmp/immortalwrt
           # custom plugin: campusauth 2.0.3
@@ -40,17 +43,107 @@ jobs:
           cp -r $GITHUB_WORKSPACE/files/* files/
           # build config
           cp $GITHUB_WORKSPACE/.config .config
+          # ROCK Pi E gigabit ethernet delay fix (tx_delay 0x26->0x1a, rx_delay 0x11->0x14)
+          # applied as a kernel DTS patch so the DTB compiled into the final image carries it
+          cp $GITHUB_WORKSPACE/patches/110-rockchip-rk3328-rock-pi-e-ethernet-delay.patch target/linux/rockchip/patches-6.6/
+          echo "--- DTS patch content ---"
+          grep -n "tx_delay\|rx_delay" target/linux/rockchip/patches-6.6/110-rockchip-rk3328-rock-pi-e-ethernet-delay.patch | head
           # iStore src-link (pinned commit)
           git clone --depth=1 https://github.com/linkease/istore.git /tmp/istore-src
           cd /tmp/istore-src && git fetch --depth=1 origin 3fca15b30aeed9ecacb3efc8b4a8b9c2584ad5c7 && git checkout FETCH_HEAD
           echo "src-link istore /tmp/istore-src" >> /tmp/immortalwrt/feeds.conf
+          # luci-app-qosify: upstream package (pinned commit), Chinese UI applied in-place below
+          git clone --depth=1 https://github.com/choppyc79/luci-app-qosify.git /tmp/qosify-luci-src
+          cd /tmp/qosify-luci-src && git fetch --depth=1 origin 8e69989d58137c01c9f28c590784a7936c3877af && git checkout FETCH_HEAD
+          echo "src-link qosify-luci /tmp/qosify-luci-src" >> /tmp/immortalwrt/feeds.conf
           cd /tmp/immortalwrt
           # UA2F required kernel config
           echo "CONFIG_NETFILTER_NETLINK_GLUE_CT=y" >> target/linux/rockchip/armv8/config-6.6
+          # capture source diff BEFORE defconfig (only our manual changes)
+          git add -A
+          git diff --cached > /tmp/source-diff.txt || true
+          wc -l /tmp/source-diff.txt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          # Chinese localization of the qosify LuCI page (350 strings, in-place on the installed feed)
+          python3 $GITHUB_WORKSPACE/scripts/translate_qosify.py package/feeds/qosify-luci/qosify-luci.sh
           make defconfig
           make -j$(nproc) > /tmp/build.log 2>&1 || { make -j1 V=s >> /tmp/build.log 2>&1; exit 1; }
+
+      - name: Verify DTB in final image
+        if: success()
+        run: |
+          set -e
+          sudo apt-get install -y -q device-tree-compiler u-boot-tools >/dev/null 2>&1
+          cd /tmp/immortalwrt/bin/targets/rockchip/armv8
+          IMG=$(ls immortalwrt-rockchip-armv8-radxa_rock-pi-e-squashfs-sysupgrade.img.gz | head -1)
+          [ -n "$IMG" ] || { echo "NO IMAGE FOUND" > /tmp/build-dtb-check.txt; exit 1; }
+          gzip -dfk "$IMG"
+          RAW="${IMG%.gz}"
+          {
+            echo "===== DTB verification ====="
+            echo "image: $IMG"
+            # 1) locate kernel partition from GPT
+            python3 - "$RAW" << 'PY'
+          import sys, struct
+          img = sys.argv[1]
+          data = open(img, 'rb').read()
+          hdr = data[512:1024]
+          assert hdr[:8] == b'EFI PART', "not a GPT image"
+          nparts = struct.unpack('<I', hdr[80:84])[0]
+          partsz = struct.unpack('<I', hdr[84:88])[0]
+          cur = 1024
+          cand = None
+          for i in range(nparts):
+              e = data[cur:cur+partsz]; cur += partsz
+              if e[0:16] == b'\x00'*16: continue
+              name = e[56:128].decode('utf-16-le').rstrip('\x00')
+              first, last = struct.unpack('<QQ', e[32:48])
+              size = (last-first+1)*512
+              print(f"partition: {name} start_lba={first} size={size}")
+              if 'kernel' in name.lower() or 'boot' in name.lower():
+                  cand = (name, first, size)
+          if cand is None:
+              print("ERROR: no kernel/boot partition"); sys.exit(3)
+          name, start, size = cand
+          off = start*512
+          open('/tmp/kernel-part.bin','wb').write(data[off:off+size])
+          print(f"extracted {name} -> /tmp/kernel-part.bin ({size} bytes)")
+          PY
+            # 2) inspect FIT image
+            dumpimage -l /tmp/kernel-part.bin > /tmp/fit-list.txt 2>&1 || true
+            echo "--- FIT contents ---"
+            cat /tmp/fit-list.txt
+            # 3) extract the fdt blob from the FIT (flat_dt, index 0)
+            dumpimage -T flat_dt -p 0 -O dtb -o /tmp/board.dtb /tmp/kernel-part.bin
+            echo "--- extracted DTB: /tmp/board.dtb ---"
+            fdtget -l /tmp/board.dtb / > /tmp/fdt-nodes.txt 2>&1 || true
+            ETH=""
+            while IFS= read -r line; do
+              case "$line" in
+                *ethernet@ff540000*) ETH="$line"; break;;
+              esac
+            done < /tmp/fdt-nodes.txt
+            [ -z "$ETH" ] && ETH="/ethernet@ff540000"
+            TX=$(fdtget -t x /tmp/board.dtb "$ETH" tx_delay 2>&1)
+            RX=$(fdtget -t x /tmp/board.dtb "$ETH" rx_delay 2>&1)
+            echo "gmac2io ($ETH): tx_delay=$TX rx_delay=$RX"
+            echo "EXPECTED: tx_delay=0x1a rx_delay=0x14"
+            if [ "$TX" = "0x1a" ] && [ "$RX" = "0x14" ]; then
+              echo "RESULT: OK"
+            else
+              echo "RESULT: MISMATCH"; exit 5
+            fi
+            # cross-check the build_dir dtb (what the kernel actually compiled)
+            BUILD_DTB=$(find /tmp/immortalwrt/build_dir -name 'rk3328-rock-pi-e.dtb' | head -1)
+            if [ -n "$BUILD_DTB" ]; then
+              BTX=$(fdtget -t x "$BUILD_DTB" "$ETH" tx_delay 2>&1)
+              BRX=$(fdtget -t x "$BUILD_DTB" "$ETH" rx_delay 2>&1)
+              echo "build_dir dtb ($BUILD_DTB): tx_delay=$BTX rx_delay=$BRX"
+            fi
+          } > /tmp/build-dtb-check.txt 2>&1 || { tail -n 40 /tmp/build-dtb-check.txt; exit 1; }
+          echo "=== DTB check result ==="
+          cat /tmp/build-dtb-check.txt
 
       - name: Collect error tail on failure
         if: failure()
@@ -71,6 +164,10 @@ jobs:
             /tmp/immortalwrt/bin/targets/rockchip/armv8/*.manifest
             /tmp/immortalwrt/bin/targets/rockchip/armv8/sha256sums
             /tmp/immortalwrt/bin/targets/rockchip/armv8/config.buildinfo
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/feeds.buildinfo
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/version.buildinfo
+            /tmp/build-dtb-check.txt
+            /tmp/source-diff.txt
           if-no-files-found: error
 
       - name: Publish to GitHub Release
@@ -82,11 +179,21 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: Build #${{ github.run_number }} - ${{ job.status }}
           body: |
+            ImmortalWrt 24.10.6 ROCK Pi E
+            - run id: ${{ github.run_number }}
+            - immortalwrt rev: ${{ env.IMMORTALWRT_REV }} (${{ env.IMMORTALWRT_TAG }})
+            - change: gmac2io tx_delay=0x1a rx_delay=0x14 (DTB verified in final image)
+            - qosify + luci-app-qosify (Chinese UI), campusauth 2.0.3, UA2F, iStore, Argon, zh-cn
+
             ${{ job.status == 'success' && 'Firmware build succeeded. Download the .img.gz and verify SHA-256.' || 'Build failed. Error log attached (if present).' }}
           files: |
             /tmp/immortalwrt/bin/targets/rockchip/armv8/*.img.gz
             /tmp/immortalwrt/bin/targets/rockchip/armv8/*.manifest
             /tmp/immortalwrt/bin/targets/rockchip/armv8/sha256sums
             /tmp/immortalwrt/bin/targets/rockchip/armv8/config.buildinfo
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/feeds.buildinfo
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/version.buildinfo
+            /tmp/build-dtb-check.txt
+            /tmp/source-diff.txt
             /tmp/build-error.log
           fail_on_unmatched_files: false
