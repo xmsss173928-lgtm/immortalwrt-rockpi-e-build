@@ -13,6 +13,11 @@ jobs:
       - name: Checkout config repo
         uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell
+          df -h / | tail -1
+
       - name: Install build dependencies
         run: |
           sudo apt-get update -q
@@ -45,9 +50,19 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           make defconfig
-          make -j$(nproc) || make -j1 V=s
+          make -j$(nproc) 2>&1 | tee /tmp/build.log || (make -j1 V=s 2>&1 | tee -a /tmp/build.log; exit 1)
+
+      - name: Collect error tail on failure
+        if: failure()
+        run: |
+          tail -n 200 /tmp/build.log > /tmp/build-error.log || true
+          echo "--- disk space ---" >> /tmp/build-error.log
+          df -h >> /tmp/build-error.log 2>&1 || true
+          echo "--- target dir ---" >> /tmp/build-error.log
+          ls -la /tmp/immortalwrt/bin/targets/rockchip/armv8/ 2>/dev/null | head -20 >> /tmp/build-error.log || true
 
       - name: Upload firmware artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: firmware
@@ -57,3 +72,21 @@ jobs:
             /tmp/immortalwrt/bin/targets/rockchip/armv8/sha256sums
             /tmp/immortalwrt/bin/targets/rockchip/armv8/config.buildinfo
           if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build #${{ github.run_number }} - ${{ job.status }}
+          body: |
+            ${{ job.status == 'success' && 'Firmware build succeeded. Download the .img.gz and verify SHA-256.' || 'Build failed. Error log attached (if present).' }}
+          files: |
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/*.img.gz
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/*.manifest
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/sha256sums
+            /tmp/immortalwrt/bin/targets/rockchip/armv8/config.buildinfo
+            /tmp/build-error.log
+          fail_on_unmatched_files: false
